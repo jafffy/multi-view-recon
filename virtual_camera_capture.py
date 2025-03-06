@@ -6,8 +6,10 @@ import json
 import argparse
 import open3d as o3d
 from datetime import datetime
-import math
 import time
+
+# Import the point cloud processor
+from point_cloud_utils import PointCloudProcessor
 
 class VirtualCameraCapture:
     def __init__(self, ply_path, output_dir=None, resolution=(1280, 720)):
@@ -36,34 +38,15 @@ class VirtualCameraCapture:
         self.cache_dir = os.path.join(output_dir, "cache")
         os.makedirs(self.cache_dir, exist_ok=True)
         
-        # Create a cached filename based on the input ply path
-        ply_basename = os.path.basename(ply_path)
-        self.normals_cache_path = os.path.join(self.cache_dir, f"{os.path.splitext(ply_basename)[0]}_with_normals.ply")
+        # Initialize the point cloud processor
+        self.processor = PointCloudProcessor(ply_path, self.cache_dir)
         
-        # Load the point cloud
-        try:
-            # Check if we have a cached version with normals
-            if os.path.exists(self.normals_cache_path):
-                print(f"Loading point cloud with cached normals from: {self.normals_cache_path}")
-                self.point_cloud = o3d.io.read_point_cloud(self.normals_cache_path)
-                if not self.point_cloud.has_points():
-                    raise ValueError(f"No points found in cached file {self.normals_cache_path}")
-                
-                # Verify the cached point cloud has normals
-                if not self.point_cloud.has_normals():
-                    print("Cached point cloud doesn't have normals. Loading original and recomputing...")
-                    self.load_and_process_point_cloud(ply_path)
-            else:
-                # Load and process the original point cloud
-                self.load_and_process_point_cloud(ply_path)
-        except Exception as e:
-            raise ValueError(f"Failed to load point cloud: {e}")
-        
-        # Calculate bounding box and center
-        self.bbox = self.point_cloud.get_axis_aligned_bounding_box()
-        self.center = self.bbox.get_center()
-        self.extent = self.bbox.get_extent()
-        self.radius = np.linalg.norm(self.extent) * 0.8  # Camera distance from center
+        # Get point cloud properties
+        self.point_cloud = self.processor.point_cloud
+        self.center = self.processor.center
+        self.extent = self.processor.extent
+        self.radius = self.processor.radius
+        self.bbox = self.processor.bbox
         
         # Display the point cloud to confirm it's loaded correctly
         self.preview_point_cloud()
@@ -74,46 +57,11 @@ class VirtualCameraCapture:
         # Initialize captured data
         self.captured_frames = []
     
-    def load_and_process_point_cloud(self, ply_path):
-        """
-        Load and process the point cloud, computing normals if needed
-        
-        Args:
-            ply_path (str): Path to the input PLY file
-        """
-        print(f"Loading point cloud: {ply_path}")
-        self.point_cloud = o3d.io.read_point_cloud(ply_path)
-        if not self.point_cloud.has_points():
-            raise ValueError(f"No points found in {ply_path}")
-        
-        # Print basic information about the point cloud
-        print(f"Point cloud loaded: {ply_path}")
-        print(f"Number of points: {len(self.point_cloud.points)}")
-        print(f"Point cloud has colors: {self.point_cloud.has_colors()}")
-        print(f"Point cloud has normals: {self.point_cloud.has_normals()}")
-        
-        # If the point cloud doesn't have normals, estimate them for better visualization
-        if not self.point_cloud.has_normals():
-            print("Estimating normals for better visualization...")
-            self.point_cloud.estimate_normals(
-                search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30)
-            )
-            self.point_cloud.orient_normals_consistent_tangent_plane(100)
-            
-            # Save the point cloud with normals for future use
-            print(f"Saving point cloud with normals to cache: {self.normals_cache_path}")
-            o3d.io.write_point_cloud(self.normals_cache_path, self.point_cloud)
-    
     def preview_point_cloud(self):
         """
         Show the point cloud to verify it's loaded correctly
         """
-        print("Showing point cloud preview (close window to continue)...")
-        o3d.visualization.draw_geometries([self.point_cloud], 
-                                        window_name="Point Cloud Preview",
-                                        width=800, 
-                                        height=600,
-                                        point_show_normal=False)
+        self.processor.preview_point_cloud("Point Cloud Preview", 800, 600)
     
     def initialize_camera_parameters(self):
         """
@@ -161,89 +109,7 @@ class VirtualCameraCapture:
         Returns:
             List of camera positions (eye points)
         """
-        positions = []
-        
-        # Instead of a full sphere, use a hemisphere with more consistent baselines
-        # This will ensure cameras are not too far apart and have better overlap
-        
-        # Calculate a better radius based on the point cloud size
-        # Get much closer to the object for better feature extraction and matching
-        self.radius = np.linalg.norm(self.extent) * 0.8  # Reduced from 1.2 to get much closer
-        print(f"Camera distance from center: {self.radius}")
-        
-        # Create a hemisphere of positions with more consistent spacing
-        # Use a spiral pattern on a hemisphere for more uniform coverage
-        indices = np.arange(0, num_views)
-        phi = np.arccos(1.0 - indices / float(num_views - 1))  # 0 to pi/2 (hemisphere)
-        theta = np.pi * (1 + 5**0.5) * indices  # Golden angle in radians
-        
-        # Convert spherical to Cartesian coordinates
-        x = self.radius * np.sin(phi) * np.cos(theta)
-        y = self.radius * np.sin(phi) * np.sin(theta)
-        z = self.radius * np.cos(phi)  # Will be positive for hemisphere
-        
-        # Add some randomization to avoid perfectly regular patterns
-        # which can cause issues with feature matching
-        np.random.seed(42)  # For reproducibility
-        jitter = self.radius * 0.05  # 5% jitter
-        x += np.random.uniform(-jitter, jitter, num_views)
-        y += np.random.uniform(-jitter, jitter, num_views)
-        z += np.random.uniform(-jitter, jitter, num_views)
-        
-        # Ensure minimum distance between consecutive cameras (for good baseline)
-        min_baseline = self.radius * 0.08  # Minimum baseline - reduced for closer views
-        max_baseline = self.radius * 0.25  # Maximum baseline - also reduced
-        
-        # Center the positions around the point cloud center
-        for i in range(num_views):
-            pos = np.array([
-                x[i] + self.center[0],
-                y[i] + self.center[1],
-                z[i] + self.center[2]
-            ])
-            
-            # Add position if it's the first one or has appropriate baseline from previous
-            if i == 0:
-                positions.append(pos)
-            else:
-                baseline = np.linalg.norm(pos - positions[-1])
-                if min_baseline <= baseline <= max_baseline:
-                    positions.append(pos)
-                else:
-                    # Adjust position to get better baseline
-                    direction = pos - positions[-1]
-                    direction = direction / np.linalg.norm(direction)
-                    adjusted_pos = positions[-1] + direction * (min_baseline + max_baseline) / 2
-                    positions.append(adjusted_pos)
-        
-        # If we ended up with fewer positions due to adjustments, add more
-        while len(positions) < num_views:
-            # Add intermediate positions between existing ones
-            new_positions = []
-            for i in range(len(positions) - 1):
-                midpoint = (positions[i] + positions[i+1]) / 2
-                # Add some jitter to avoid collinearity
-                midpoint += np.random.uniform(-jitter, jitter, 3)
-                new_positions.append(midpoint)
-                
-            # Add new positions, but don't exceed num_views
-            for pos in new_positions:
-                if len(positions) < num_views:
-                    positions.append(pos)
-                else:
-                    break
-        
-        # Ensure we have exactly num_views positions
-        positions = positions[:num_views]
-        
-        # Print the range of baselines for debugging
-        baselines = []
-        for i in range(len(positions) - 1):
-            baseline = np.linalg.norm(positions[i] - positions[i+1])
-            baselines.append(baseline)
-        print(f"Camera baseline range: {min(baselines):.2f} to {max(baselines):.2f}")
-        
-        return positions
+        return self.processor.get_camera_positions(num_views)
     
     def calculate_extrinsic_matrix(self, eye_pos):
         """
@@ -255,63 +121,7 @@ class VirtualCameraCapture:
         Returns:
             extrinsic (4x4 matrix): Camera extrinsic matrix
         """
-        # Look at the center of the point cloud
-        target = self.center
-        
-        # Try to vary the up vector slightly for each camera to avoid
-        # having all cameras with the same orientation
-        # This helps with feature matching between views
-        
-        # Generate a slightly randomized up vector
-        # Start with standard up vector
-        up = np.array([0, 1, 0])
-        
-        # Add small random perturbation to up vector (within 15 degrees)
-        np.random.seed(int(np.sum(eye_pos) * 1000) % 10000)  # Deterministic but different for each position
-        angle = np.random.uniform(-0.25, 0.25)  # ~15 degrees in radians
-        axis = np.random.uniform(-1, 1, 3)
-        axis = axis / np.linalg.norm(axis)
-        
-        # Create rotation matrix for the perturbation
-        cos_angle = np.cos(angle)
-        sin_angle = np.sin(angle)
-        ux, uy, uz = axis
-        rotation_matrix = np.array([
-            [cos_angle + ux*ux*(1-cos_angle), ux*uy*(1-cos_angle)-uz*sin_angle, ux*uz*(1-cos_angle)+uy*sin_angle],
-            [uy*ux*(1-cos_angle)+uz*sin_angle, cos_angle+uy*uy*(1-cos_angle), uy*uz*(1-cos_angle)-ux*sin_angle],
-            [uz*ux*(1-cos_angle)-uy*sin_angle, uz*uy*(1-cos_angle)+ux*sin_angle, cos_angle+uz*uz*(1-cos_angle)]
-        ])
-        
-        # Apply rotation to up vector
-        up = rotation_matrix @ up
-            
-        # Calculate camera basis vectors
-        forward = target - eye_pos
-        forward = forward / np.linalg.norm(forward)
-        
-        right = np.cross(forward, up)
-        if np.linalg.norm(right) < 1e-6:
-            # If forward and up are nearly parallel, choose a different up
-            up = np.array([1, 0, 0])
-            right = np.cross(forward, up)
-        
-        right = right / np.linalg.norm(right)
-        
-        new_up = np.cross(right, forward)
-        new_up = new_up / np.linalg.norm(new_up)
-        
-        # Construct the rotation matrix
-        rotation = np.eye(3)
-        rotation[0, :] = right
-        rotation[1, :] = new_up
-        rotation[2, :] = -forward
-        
-        # Construct the extrinsic matrix [R|t]
-        extrinsic = np.eye(4)
-        extrinsic[:3, :3] = rotation
-        extrinsic[:3, 3] = -rotation @ eye_pos
-        
-        return extrinsic
+        return self.processor.calculate_extrinsic_matrix(eye_pos)
     
     def capture_view(self, view_id, eye_pos):
         """
