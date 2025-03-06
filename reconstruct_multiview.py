@@ -928,16 +928,11 @@ class MultiViewReconstruction:
 
 def main():
     parser = argparse.ArgumentParser(description='Multi-view reconstruction tool')
-    parser.add_argument('--data', '-d', type=str, required=True,
-                      help='Directory containing capture data (images and camera parameters)')
-    parser.add_argument('--visualize', '-v', action='store_true',
-                      help='Visualize the reconstruction result')
-    parser.add_argument('--second_pass', action='store_true', 
-                      help='Perform a second pass reconstruction')
-    parser.add_argument('--enhance-views', action='store_true', 
-                      help='Generate enhanced views of the model')
-    parser.add_argument('--num-views', type=int, default=24, 
-                      help='Number of enhanced views to generate')
+    parser.add_argument('data_dir', help='Path to the capture data directory')
+    parser.add_argument('--visualize', action='store_true', help='Visualize the reconstruction')
+    parser.add_argument('--second-pass', action='store_true', help='Perform a second pass reconstruction')
+    parser.add_argument('--enhance-views', action='store_true', help='Generate enhanced views of the model')
+    parser.add_argument('--num-views', type=int, default=24, help='Number of enhanced views to generate')
     parser.add_argument('--use-ransac-pose', action='store_true', default=True, 
                       help='Use RANSAC-based pose estimation when provided poses fail (default: True)')
     parser.add_argument('--no-ransac-pose', action='store_false', dest='use_ransac_pose',
@@ -946,10 +941,10 @@ def main():
     args = parser.parse_args()
     
     try:
-        # Initialize reconstruction
-        mvr = MultiViewReconstruction(data_dir=args.data)
+        # Create the reconstruction object
+        mvr = MultiViewReconstruction(args.data_dir)
         
-        # Perform reconstruction
+        # Perform the reconstruction
         print("Starting reconstruction...")
         success = mvr.reconstruct(use_ransac_pose=args.use_ransac_pose)
         
