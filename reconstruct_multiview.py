@@ -66,12 +66,23 @@ class MultiViewReconstruction:
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         else:
             gray = image
+        
+        # Optional: Improve image contrast
+        gray = cv2.equalizeHist(gray)
             
-        # Create SIFT detector
-        sift = cv2.SIFT_create()
+        # Create SIFT detector with more sensitive parameters
+        sift = cv2.SIFT_create(
+            nfeatures=0,          # Maximum number of features (0 = unlimited)
+            nOctaveLayers=5,      # Default is 3
+            contrastThreshold=0.02,  # Default is 0.04 (lower = more features)
+            edgeThreshold=15,      # Default is 10
+            sigma=1.6             # Default is 1.6
+        )
         
         # Detect and compute keypoints and descriptors
         keypoints, descriptors = sift.detectAndCompute(gray, None)
+        
+        print(f"Detected {len(keypoints) if keypoints is not None else 0} features")
         
         return keypoints, descriptors
     
@@ -85,21 +96,41 @@ class MultiViewReconstruction:
         Returns:
             list of matches
         """
+        if desc1 is None or desc2 is None:
+            return []
+            
+        if len(desc1) < 2 or len(desc2) < 2:
+            return []
+            
         # Use FLANN for fast matching
         FLANN_INDEX_KDTREE = 1
         index_params = dict(algorithm=FLANN_INDEX_KDTREE, trees=5)
-        search_params = dict(checks=50)
+        search_params = dict(checks=100)  # Increased from 50
         
-        flann = cv2.FlannBasedMatcher(index_params, search_params)
+        try:
+            # Try FLANN matcher first
+            flann = cv2.FlannBasedMatcher(index_params, search_params)
+            
+            # Find 2 best matches for each descriptor
+            matches = flann.knnMatch(desc1, desc2, k=2)
+            
+            # Apply Lowe's ratio test with less strict threshold
+            good_matches = []
+            for m, n in matches:
+                if m.distance < 0.8 * n.distance:  # Changed from 0.7 to 0.8
+                    good_matches.append(m)
+        except Exception as e:
+            print(f"FLANN matcher failed: {e}. Trying Brute Force matcher...")
+            # Fall back to Brute Force matcher
+            bf = cv2.BFMatcher()
+            matches = bf.knnMatch(desc1, desc2, k=2)
+            
+            good_matches = []
+            for m, n in matches:
+                if m.distance < 0.85 * n.distance:  # Even less strict for BF matcher
+                    good_matches.append(m)
         
-        # Find 2 best matches for each descriptor
-        matches = flann.knnMatch(desc1, desc2, k=2)
-        
-        # Apply Lowe's ratio test to filter good matches
-        good_matches = []
-        for m, n in matches:
-            if m.distance < 0.7 * n.distance:
-                good_matches.append(m)
+        print(f"Found {len(good_matches)} good matches")
                 
         return good_matches
     
@@ -117,20 +148,34 @@ class MultiViewReconstruction:
         Returns:
             3D points, corresponding point colors
         """
+        # Save debug images
+        debug_dir = os.path.join(self.output_dir, "debug")
+        os.makedirs(debug_dir, exist_ok=True)
+        
         # Detect features
         kp1, desc1 = self.detect_features(img1)
         kp2, desc2 = self.detect_features(img2)
         
-        if desc1 is None or desc2 is None or len(kp1) < 5 or len(kp2) < 5:
+        # Reduced minimum feature requirement from 5 to 4
+        if desc1 is None or desc2 is None or len(kp1) < 4 or len(kp2) < 4:
             print("Not enough features detected")
             return None, None
         
         # Match features
         matches = self.match_features(desc1, desc2)
         
-        if len(matches) < 8:
+        # Reduced minimum matches requirement from 8 to 5
+        if len(matches) < 5:
             print("Not enough good matches")
             return None, None
+        
+        # Draw matches for debugging
+        try:
+            match_img = cv2.drawMatches(img1, kp1, img2, kp2, matches, None, 
+                                        flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS)
+            cv2.imwrite(os.path.join(debug_dir, f"matches_{len(matches)}.jpg"), match_img)
+        except Exception as e:
+            print(f"Could not save match debug image: {e}")
         
         # Extract matched points
         points1 = np.float32([kp1[m.queryIdx].pt for m in matches])
@@ -153,6 +198,7 @@ class MultiViewReconstruction:
         
         # Convert to 3D points
         points_3d = cv2.convertPointsFromHomogeneous(points_4d.T).reshape(-1, 3)
+        print(f"Triangulated {len(points_3d)} points")
         
         # Get colors from first image
         points_colors = []
@@ -172,14 +218,14 @@ class MultiViewReconstruction:
         
         return points_3d, np.array(points_colors)
     
-    def filter_points(self, points_3d, min_distance=0.01, max_distance=10.0):
+    def filter_points(self, points_3d, min_distance=0.0001, max_distance=100.0):
         """
         Filter out outlier points
         
         Args:
             points_3d: 3D points
-            min_distance: Minimum distance from origin
-            max_distance: Maximum distance from origin
+            min_distance: Minimum distance from origin (reduced from 0.001)
+            max_distance: Maximum distance from origin (increased from 20.0)
             
         Returns:
             Filtered points, corresponding indices
@@ -190,9 +236,26 @@ class MultiViewReconstruction:
         # Calculate distances from origin
         distances = np.linalg.norm(points_3d, axis=1)
         
-        # Filter points
+        # Filter points with a much more relaxed criteria
         valid_indices = np.where((distances >= min_distance) & (distances <= max_distance))[0]
         filtered_points = points_3d[valid_indices]
+        
+        # Apply statistical outlier removal to eliminate extreme outliers while keeping most points
+        if len(filtered_points) > 10:  # Need sufficient points for statistical analysis
+            # Calculate median distance and median absolute deviation
+            median_distance = np.median(distances[valid_indices])
+            mad = np.median(np.abs(distances[valid_indices] - median_distance))
+            
+            # Use a generous threshold of median ± 10 * MAD
+            # This will keep most points while removing extreme outliers
+            inlier_indices = np.where(
+                np.abs(distances[valid_indices] - median_distance) < 10.0 * mad
+            )[0]
+            
+            filtered_points = filtered_points[inlier_indices]
+            valid_indices = valid_indices[inlier_indices]
+        
+        print(f"Filtered points: {len(filtered_points)}/{len(points_3d)} points kept")
         
         return filtered_points, valid_indices
     
@@ -211,27 +274,54 @@ class MultiViewReconstruction:
         all_point_colors = []
         
         print(f"Reconstructing from {len(self.views)} views...")
+        print(f"Images directory: {self.images_dir}")
+        
+        # Try different pairs, not just consecutive ones
+        pairs_to_try = []
+        
+        # Add consecutive pairs (i, i+1)
+        for i in range(len(self.views) - 1):
+            pairs_to_try.append((i, i+1))
+            
+        # Add some pairs with larger baseline (i, i+2) and (i, i+3)
+        for i in range(len(self.views) - 2):
+            pairs_to_try.append((i, i+2))
+            
+        for i in range(len(self.views) - 3):
+            pairs_to_try.append((i, i+3))
         
         # Process pairs of views
-        for i in tqdm(range(len(self.views) - 1)):
+        for i, j in tqdm(pairs_to_try):
             # Get current and next view
             view1 = self.views[i]
-            view2 = self.views[i + 1]
+            view2 = self.views[j]
+            
+            print(f"\nProcessing view pair ({i}, {j})")
             
             # Load images
-            img1_path = os.path.join(self.data_dir, view1['image_path'])
-            img2_path = os.path.join(self.data_dir, view2['image_path'])
+            # Check if the image_path contains the data_dir already
+            img1_path = view1['image_path']
+            img2_path = view2['image_path']
+            
+            # If the path is relative (doesn't start with data_dir), join with data_dir
+            if self.data_dir not in img1_path:
+                img1_path = os.path.join(self.images_dir, os.path.basename(img1_path))
+            if self.data_dir not in img2_path:
+                img2_path = os.path.join(self.images_dir, os.path.basename(img2_path))
             
             if not os.path.exists(img1_path) or not os.path.exists(img2_path):
-                print(f"Warning: Image not found, skipping pair {i}, {i+1}")
+                print(f"Warning: Image not found, skipping pair {i}, {j}")
+                print(f"Searched for: {img1_path} and {img2_path}")
                 continue
                 
             img1 = cv2.imread(img1_path)
             img2 = cv2.imread(img2_path)
             
             if img1 is None or img2 is None:
-                print(f"Warning: Failed to load images, skipping pair {i}, {i+1}")
+                print(f"Warning: Failed to load images, skipping pair {i}, {j}")
                 continue
+                
+            print(f"Loaded images: {os.path.basename(img1_path)} ({img1.shape}) and {os.path.basename(img2_path)} ({img2.shape})")
             
             # Get camera poses
             extrinsic1 = np.array(view1['extrinsic_matrix'])
@@ -243,6 +333,10 @@ class MultiViewReconstruction:
             
             R2 = extrinsic2[:3, :3]
             t2 = extrinsic2[:3, 3]
+            
+            # Calculate baseline (distance between cameras)
+            baseline = np.linalg.norm(t2 - t1)
+            print(f"Baseline distance: {baseline:.4f}")
             
             # Triangulate points between this pair of views
             points_3d, point_colors = self.triangulate_points(
@@ -279,9 +373,37 @@ class MultiViewReconstruction:
         print("Removing outliers...")
         pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
         
-        # Estimate normals
-        print("Estimating normals...")
-        pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30))
+        # Create a cache directory for normals if it doesn't exist
+        cache_dir = os.path.join(self.output_dir, "cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        
+        # Cache filename for the point cloud with normals
+        normals_cache_path = os.path.join(cache_dir, "reconstruction_with_normals.ply")
+        
+        # Check if we have a cached version with normals
+        if os.path.exists(normals_cache_path):
+            print(f"Loading point cloud with cached normals from: {normals_cache_path}")
+            try:
+                cached_pcd = o3d.io.read_point_cloud(normals_cache_path)
+                
+                # Verify the cached point cloud has normals and points
+                if cached_pcd.has_normals() and len(cached_pcd.points) > 0:
+                    # Make sure the cached cloud has the same number of points
+                    if len(cached_pcd.points) == len(pcd.points):
+                        print("Using cached normals")
+                        pcd = cached_pcd
+                    else:
+                        print("Cached point cloud has different number of points. Recomputing normals...")
+                        pcd = self.compute_and_cache_normals(pcd, normals_cache_path)
+                else:
+                    print("Cached point cloud doesn't have normals or points. Recomputing...")
+                    pcd = self.compute_and_cache_normals(pcd, normals_cache_path)
+            except Exception as e:
+                print(f"Error loading cached normals: {e}. Recomputing...")
+                pcd = self.compute_and_cache_normals(pcd, normals_cache_path)
+        else:
+            # Compute and cache normals
+            pcd = self.compute_and_cache_normals(pcd, normals_cache_path)
         
         # Save the point cloud
         output_ply = os.path.join(self.output_dir, "reconstruction.ply")
@@ -291,7 +413,44 @@ class MultiViewReconstruction:
         print(f"Reconstruction completed. Point cloud saved to: {output_ply}")
         print(f"Number of points: {len(pcd.points)}")
         
+        # Add information about point cloud scale to help diagnose the "too far" issue
+        if len(pcd.points) > 0:
+            # Calculate bounding box
+            bbox = pcd.get_axis_aligned_bounding_box()
+            min_bound = bbox.min_bound
+            max_bound = bbox.max_bound
+            extent = bbox.get_extent()
+            
+            print(f"Point cloud bounding box:")
+            print(f"  Min bounds: [{min_bound[0]:.2f}, {min_bound[1]:.2f}, {min_bound[2]:.2f}]")
+            print(f"  Max bounds: [{max_bound[0]:.2f}, {max_bound[1]:.2f}, {max_bound[2]:.2f}]")
+            print(f"  Size: [{extent[0]:.2f}, {extent[1]:.2f}, {extent[2]:.2f}]")
+            
+            # Calculate distance from origin to help understand scale issues
+            distances = np.linalg.norm(np.asarray(pcd.points), axis=1)
+            avg_distance = np.mean(distances)
+            print(f"Average distance from origin: {avg_distance:.2f}")
+            print(f"Min distance from origin: {np.min(distances):.2f}")
+            print(f"Max distance from origin: {np.max(distances):.2f}")
+            
         return True
+    
+    def compute_and_cache_normals(self, pcd, cache_path):
+        """
+        Compute normals for a point cloud and cache the result
+        
+        Args:
+            pcd: Point cloud to compute normals for
+            cache_path: Path to save the cached point cloud with normals
+        """
+        print("Estimating normals...")
+        pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30))
+        
+        # Save to cache
+        print(f"Saving point cloud with normals to cache: {cache_path}")
+        o3d.io.write_point_cloud(cache_path, pcd)
+        
+        return pcd
     
     def visualize(self):
         """
