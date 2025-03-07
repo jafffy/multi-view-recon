@@ -162,15 +162,16 @@ class PointCloudProcessor:
         # Use custom radius if provided, otherwise use computed radius
         radius = custom_radius if custom_radius is not None else self.radius
         
-        # Create a hemisphere of positions with spiral pattern for uniform coverage
+        # Create a full sphere of positions with spiral pattern for uniform coverage
+        # Modified to use full sphere (phi from 0 to pi) instead of just hemisphere
         indices = np.arange(0, num_views)
-        phi = np.arccos(1.0 - indices / float(num_views - 1))  # 0 to pi/2 (hemisphere)
+        phi = np.arccos(1.0 - 2.0 * indices / float(num_views - 1))  # 0 to pi (full sphere)
         theta = np.pi * (1 + 5**0.5) * indices  # Golden angle in radians
         
         # Convert spherical to Cartesian coordinates
         x = radius * np.sin(phi) * np.cos(theta)
         y = radius * np.sin(phi) * np.sin(theta)
-        z = radius * np.cos(phi)  # Will be positive for hemisphere
+        z = radius * np.cos(phi)  # Will cover both positive and negative Z
         
         # Add some randomization to avoid perfectly regular patterns
         np.random.seed(42)  # For reproducibility

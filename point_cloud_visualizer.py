@@ -176,10 +176,66 @@ class PointCloudVisualizer:
             sphere.paint_uniform_color([1, 0.7, 0])  # Yellowish
             camera_geometries.append(sphere)
             
-            # Add view ID text above camera
-            # Note: Text is not directly supported in Open3D, so this is a workaround
-            # In a real application, you might want to use other libraries for better text rendering
+            # Add a clear direction indicator (arrow from camera to center)
+            # Get the center of the point cloud
+            center = np.array(self.camera_params['center'])
             
+            # Calculate the direction vector from camera to center
+            direction = center - camera_pos
+            direction = direction / np.linalg.norm(direction) * (frustum_scale * 0.7)
+            
+            # Create a cylinder to represent the direction arrow
+            cylinder = o3d.geometry.TriangleMesh.create_cylinder(
+                radius=frustum_scale*0.02, 
+                height=np.linalg.norm(direction)
+            )
+            
+            # Rotate cylinder to point from camera to center
+            # Calculate rotation to align cylinder with direction
+            z_axis = np.array([0, 0, 1])  # Default cylinder orientation
+            if np.allclose(z_axis, direction / np.linalg.norm(direction), rtol=1e-5):
+                rotation_axis = np.array([1, 0, 0])
+                rotation_angle = 0
+            else:
+                rotation_axis = np.cross(z_axis, direction / np.linalg.norm(direction))
+                rotation_axis = rotation_axis / np.linalg.norm(rotation_axis)
+                cos_angle = np.dot(z_axis, direction / np.linalg.norm(direction))
+                rotation_angle = np.arccos(np.clip(cos_angle, -1.0, 1.0))
+            
+            # Create rotation matrix for cylinder alignment
+            if rotation_angle != 0:
+                cylinder_R = cylinder.get_rotation_matrix_from_axis_angle(rotation_axis * rotation_angle)
+                cylinder.rotate(cylinder_R, center=(0, 0, 0))
+            
+            # Position cylinder at camera position
+            cylinder.translate(camera_pos)
+            
+            # Make the cylinder red to clearly indicate looking direction
+            cylinder.paint_uniform_color([1, 0, 0])
+            
+            camera_geometries.append(cylinder)
+            
+            # Add cone at the end of the arrow
+            arrowhead = o3d.geometry.TriangleMesh.create_cone(
+                radius=frustum_scale*0.05, 
+                height=frustum_scale*0.1
+            )
+            
+            # Position arrowhead at the end of cylinder
+            arrowhead_pos = camera_pos + direction
+            
+            # Rotate arrowhead to point in the direction
+            if rotation_angle != 0:
+                arrowhead.rotate(cylinder_R, center=(0, 0, 0))
+            
+            # Translate to position
+            arrowhead.translate(arrowhead_pos)
+            
+            # Make arrowhead red
+            arrowhead.paint_uniform_color([1, 0, 0])
+            
+            camera_geometries.append(arrowhead)
+        
         return camera_geometries
     
     def _create_camera_orientation_axes(self):
@@ -302,15 +358,16 @@ class PointCloudVisualizer:
         
         camera_positions = np.array(camera_positions)
         
-        # Create figure
-        fig, ax = plt.subplots(figsize=(10, 10))
+        # Create two subplots: top view and side view
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 8))
         
+        # TOP VIEW (XZ plane)
         # Plot camera positions
-        ax.scatter(camera_positions[:, 0], camera_positions[:, 2], c=range(len(camera_positions)), 
-                 cmap='viridis', s=100, alpha=0.8)
+        ax1.scatter(camera_positions[:, 0], camera_positions[:, 2], c=range(len(camera_positions)), 
+                  cmap='viridis', s=100, alpha=0.8)
         
         # Connect cameras with lines
-        ax.plot(camera_positions[:, 0], camera_positions[:, 2], 'b-', alpha=0.5)
+        ax1.plot(camera_positions[:, 0], camera_positions[:, 2], 'b-', alpha=0.5)
         
         # Add arrows to show looking direction
         for i, view in enumerate(self.camera_params['views']):
@@ -322,29 +379,71 @@ class PointCloudVisualizer:
             look_dir = -R[:, 2]  # Negative Z is forward in camera coordinates
             
             # Scale the arrow
-            arrow_scale = self.camera_params['radius'] * 0.1
+            arrow_scale = self.camera_params['radius'] * 0.15
             arrow_end = camera_pos + look_dir * arrow_scale
             
             # Draw arrow
-            ax.arrow(camera_pos[0], camera_pos[2], 
-                    look_dir[0] * arrow_scale, look_dir[2] * arrow_scale,
-                    head_width=arrow_scale*0.1, head_length=arrow_scale*0.2, 
-                    fc='red', ec='red', alpha=0.7)
+            ax1.arrow(camera_pos[0], camera_pos[2], 
+                     look_dir[0] * arrow_scale, look_dir[2] * arrow_scale,
+                     head_width=arrow_scale*0.1, head_length=arrow_scale*0.2, 
+                     fc='red', ec='red', alpha=0.7)
             
             # Add camera index
-            ax.text(camera_pos[0], camera_pos[2], f' {i}', fontsize=8)
+            ax1.text(camera_pos[0], camera_pos[2], f' {i}', fontsize=8)
         
         # Add center point
         center = self.camera_params['center']
-        ax.scatter([center[0]], [center[2]], c='r', s=200, marker='*', label='Point Cloud Center')
+        ax1.scatter([center[0]], [center[2]], c='r', s=200, marker='*', label='Point Cloud Center')
         
         # Set labels and title
-        ax.set_xlabel('X')
-        ax.set_ylabel('Z')
-        ax.set_title('Camera Positions (Top View)')
-        ax.grid(True)
-        ax.axis('equal')
-        ax.legend()
+        ax1.set_xlabel('X')
+        ax1.set_ylabel('Z')
+        ax1.set_title('Camera Positions (Top View - XZ plane)')
+        ax1.grid(True)
+        ax1.axis('equal')
+        ax1.legend()
+        
+        # SIDE VIEW (YZ plane)
+        # Plot camera positions
+        ax2.scatter(camera_positions[:, 1], camera_positions[:, 2], c=range(len(camera_positions)), 
+                  cmap='viridis', s=100, alpha=0.8)
+        
+        # Connect cameras with lines
+        ax2.plot(camera_positions[:, 1], camera_positions[:, 2], 'g-', alpha=0.5)
+        
+        # Add arrows to show looking direction
+        for i, view in enumerate(self.camera_params['views']):
+            extrinsic = np.array(view['extrinsic_matrix'])
+            camera_pos = np.array(view['camera_position'])
+            
+            # The third row of R gives us the negative looking direction
+            R = extrinsic[:3, :3].T
+            look_dir = -R[:, 2]  # Negative Z is forward in camera coordinates
+            
+            # Scale the arrow
+            arrow_scale = self.camera_params['radius'] * 0.15
+            arrow_end = camera_pos + look_dir * arrow_scale
+            
+            # Draw arrow
+            ax2.arrow(camera_pos[1], camera_pos[2], 
+                     look_dir[1] * arrow_scale, look_dir[2] * arrow_scale,
+                     head_width=arrow_scale*0.1, head_length=arrow_scale*0.2, 
+                     fc='red', ec='red', alpha=0.7)
+            
+            # Add camera index
+            ax2.text(camera_pos[1], camera_pos[2], f' {i}', fontsize=8)
+        
+        # Add center point
+        center = self.camera_params['center']
+        ax2.scatter([center[1]], [center[2]], c='r', s=200, marker='*', label='Point Cloud Center')
+        
+        # Set labels and title
+        ax2.set_xlabel('Y')
+        ax2.set_ylabel('Z')
+        ax2.set_title('Camera Positions (Side View - YZ plane)')
+        ax2.grid(True)
+        ax2.axis('equal')
+        ax2.legend()
         
         plt.tight_layout()
         plt.show()
