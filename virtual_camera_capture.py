@@ -12,7 +12,7 @@ import time
 from point_cloud_utils import PointCloudProcessor
 
 class VirtualCameraCapture:
-    def __init__(self, ply_path, output_dir=None, resolution=(1280, 720), capture_depth=True):
+    def __init__(self, ply_path, output_dir=None, resolution=(1280, 720), capture_depth=True, depth_scale_factor=1.0):
         """
         Initialize the virtual camera capture system
         
@@ -21,10 +21,12 @@ class VirtualCameraCapture:
             output_dir (str, optional): Output directory for rendered images
             resolution (tuple): Image resolution as (width, height)
             capture_depth (bool): Whether to capture depth images
+            depth_scale_factor (float): Factor to scale depth values (default: 1.0, use 0.001 to convert mm to meters)
         """
         self.resolution = resolution
         self.ply_path = ply_path  # Store the PLY file path
         self.capture_depth = capture_depth
+        self.depth_scale_factor = depth_scale_factor  # Store the depth scale factor
         
         # Set output directory
         if output_dir is None:
@@ -211,7 +213,7 @@ class VirtualCameraCapture:
             'view_id': view_id,
             'image_path': image_path,
             'extrinsic_matrix': view_control.convert_to_pinhole_camera_parameters().extrinsic.tolist(),
-            'camera_position': eye_pos.tolist()
+            'camera_position': (eye_pos * self.depth_scale_factor).tolist()
         }
         
         # Process depth data if needed
@@ -227,16 +229,22 @@ class VirtualCameraCapture:
                 depth_vis[depth_mask] = (depth[depth_mask] - depth_min) / (depth_scale if depth_scale != 0 else 1)
                 depth_vis = (depth_vis * 255).astype(np.uint8)
                 
+                # Apply depth scale factor for reporting and storage
+                scaled_depth_min = depth_min * self.depth_scale_factor
+                scaled_depth_max = depth_max * self.depth_scale_factor
+                scaled_depth_scale = depth_scale * self.depth_scale_factor
+                
                 # Print depth scale information
                 print(f"Depth information for view {view_id}:")
-                print(f"  - Minimum depth: {depth_min:.4f}")
-                print(f"  - Maximum depth: {depth_max:.4f}")
-                print(f"  - Depth scale: {depth_scale:.4f}")
+                print(f"  - Minimum depth: {scaled_depth_min:.4f}")
+                print(f"  - Maximum depth: {scaled_depth_max:.4f}")
+                print(f"  - Depth scale: {scaled_depth_scale:.4f}")
             else:
                 depth_min = depth_max = depth_scale = 0
+                scaled_depth_min = scaled_depth_max = scaled_depth_scale = 0
                 print(f"No valid depth points for view {view_id}")
             
-            # Save raw depth data
+            # Save raw depth data (original values for processing flexibility)
             depth_path = os.path.join(self.depth_dir, f"depth_{view_id:03d}.npy")
             np.save(depth_path, depth)
             
@@ -244,12 +252,12 @@ class VirtualCameraCapture:
             depth_vis_path = os.path.join(self.depth_dir, f"depth_{view_id:03d}.png")
             cv2.imwrite(depth_vis_path, depth_vis)
             
-            # Add depth related info to frame data
+            # Add depth related info to frame data (using scaled values)
             frame_data['depth_path'] = depth_path
             frame_data['depth_vis_path'] = depth_vis_path
-            frame_data['depth_min'] = float(depth_min)
-            frame_data['depth_max'] = float(depth_max)
-            frame_data['depth_scale'] = float(depth_scale)
+            frame_data['depth_min'] = float(scaled_depth_min)
+            frame_data['depth_max'] = float(scaled_depth_max)
+            frame_data['depth_scale'] = float(scaled_depth_scale)
             
             print(f"Saved view {view_id}: {image_path} and depth: {depth_path}")
         else:
@@ -322,9 +330,12 @@ class VirtualCameraCapture:
             'resolution': self.resolution,
             'views': self.captured_frames,
             'point_cloud_path': self.ply_path,
-            'center': self.center.tolist(),
-            'extent': self.extent.tolist(),
-            'radius': float(self.radius)
+            'center': (self.center * self.depth_scale_factor).tolist(),
+            'extent': (self.extent * self.depth_scale_factor).tolist(),
+            'radius': float(self.radius * self.depth_scale_factor),
+            'depth_scale_factor': float(self.depth_scale_factor),
+            'original_units': 'millimeters',
+            'scaled_units': 'millimeters' if self.depth_scale_factor == 1.0 else 'meters' if self.depth_scale_factor == 0.001 else 'custom'
         }
         
         params_path = os.path.join(self.output_dir, 'camera_parameters.json')
@@ -347,6 +358,8 @@ def main():
                         help='Skip the point cloud preview')
     parser.add_argument('--no-depth', action='store_true',
                         help='Skip capturing depth images (RGB images only)')
+    parser.add_argument('--depth-scale', '-ds', type=float, default=1.0,
+                        help='Scale factor for depth values (default: 1.0, use 0.001 for mm to meters)')
     
     args = parser.parse_args()
     
@@ -360,7 +373,8 @@ def main():
             ply_path=args.ply_file,
             output_dir=args.output,
             resolution=resolution,
-            capture_depth=not args.no_depth
+            capture_depth=not args.no_depth,
+            depth_scale_factor=args.depth_scale
         )
         
         # Capture multiple views

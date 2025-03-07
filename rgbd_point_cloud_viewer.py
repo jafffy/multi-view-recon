@@ -46,21 +46,28 @@ def create_point_cloud_from_rgbd(color_img, depth_img, intrinsic, extrinsic, dep
     Returns:
         open3d.geometry.PointCloud: Point cloud
     """
-    # Normalize depth to the range expected by Open3D
-    depth_normalized = depth_img.astype(np.float32)
+    print(f"Depth image shape: {depth_img.shape}, min: {np.min(depth_img)}, max: {np.max(depth_img)}")
+    print(f"Color image shape: {color_img.shape}")
     
-    # Clip depth values to valid range
-    depth_normalized = np.clip(depth_normalized, depth_min, depth_max)
+    # Normalize depth to the range 0-1
+    depth_normalized = (depth_img - depth_min) / (depth_max - depth_min)
+    
+    # Convert to uint16 (0-65535) for Open3D
+    depth_o3d_ready = (depth_normalized * 1000).astype(np.uint16)
+    
+    # Log min/max values to verify scaling
+    print(f"Normalized depth min: {np.min(depth_normalized)}, max: {np.max(depth_normalized)}")
+    print(f"Scaled depth min: {np.min(depth_o3d_ready)}, max: {np.max(depth_o3d_ready)}")
     
     # Create Open3D images
     color_o3d = o3d.geometry.Image(color_img)
-    depth_o3d = o3d.geometry.Image(depth_normalized)
+    depth_o3d = o3d.geometry.Image(depth_o3d_ready)
     
     # Create RGBD image
     rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
         color_o3d, depth_o3d, 
-        depth_scale=depth_scale,
-        depth_trunc=depth_max,
+        depth_scale=1000.0,  # Match the scaling factor we used above
+        depth_trunc=1.0,     # Since depth is normalized to 0-1
         convert_rgb_to_intensity=False
     )
     
@@ -74,21 +81,35 @@ def create_point_cloud_from_rgbd(color_img, depth_img, intrinsic, extrinsic, dep
         cy=intrinsic[1][2]
     )
     
-    # Create point cloud
+    # Create point cloud (using identity matrix first, then transform)
     pcd = o3d.geometry.PointCloud.create_from_rgbd_image(
-        rgbd, intrinsic_o3d, extrinsic=np.linalg.inv(extrinsic)
+        rgbd, intrinsic_o3d
     )
     
+    # Apply the extrinsic transformation - we take inverse since we're going from camera to world
+    transformation = np.linalg.inv(extrinsic)
+    pcd.transform(transformation)
+    
+    # Check if point cloud is empty
+    if len(pcd.points) == 0:
+        print("Warning: Generated point cloud is empty. Skipping processing.")
+        return pcd
+    
+    print(f"Created point cloud with {len(pcd.points)} points")
+        
     # Apply statistical outlier removal - with try/except in case this fails
     try:
         pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+        print(f"After outlier removal: {len(pcd.points)} points")
     except Exception as e:
         print(f"Warning: Could not apply statistical outlier removal: {e}")
     
     # Estimate normals for better rendering - with try/except in case this fails
     try:
         pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30))
-        pcd.orient_normals_towards_camera_location(camera_location=np.array([0, 0, 0]))
+        # Only try to orient normals if the estimation was successful
+        if hasattr(pcd, 'normals') and len(pcd.normals) > 0:
+            pcd.orient_normals_towards_camera_location(camera_location=np.array([0, 0, 0]))
     except Exception as e:
         print(f"Warning: Could not estimate normals: {e}")
     
@@ -96,6 +117,7 @@ def create_point_cloud_from_rgbd(color_img, depth_img, intrinsic, extrinsic, dep
     try:
         if len(pcd.points) > 500000:
             pcd = pcd.voxel_down_sample(voxel_size=0.01)
+            print(f"After downsampling: {len(pcd.points)} points")
     except Exception as e:
         print(f"Warning: Could not apply voxel downsampling: {e}")
     
@@ -119,11 +141,17 @@ class RGBDPointCloudViewer:
         self.params = load_camera_parameters(self.params_path)
         
         # Visualization settings
-        self.point_size = 2.0
+        self.point_size = 5.0  # Increase default point size further
         self.show_coordinate_frame = True
         self.show_camera_frustum = False
         self.show_normals = False
         self.color_mode = "RGB"  # RGB, Height, Normal
+        self.depth_scale_factor = 0.01  # Use a much smaller scale factor for better visualization
+        self.show_all_point_clouds = False  # Whether to show all point clouds simultaneously
+        self.debug_mode = True  # Enable debug mode
+        
+        # Current status
+        self.status_message = "Starting up..."
         
         # Create GUI
         self.create_gui()
@@ -131,6 +159,8 @@ class RGBDPointCloudViewer:
         # Current view
         self.current_view_id = 0
         self.current_point_cloud = None
+        self.all_point_clouds = {}  # Store point clouds for each view
+        self.visible_geometries = set()  # Track which geometries are currently visible
         self.coord_frame = None
         self.camera_frustums = []
         self.vis = None
@@ -164,6 +194,18 @@ class RGBDPointCloudViewer:
         self.view_dropdown.grid(row=0, column=1, sticky=tk.W, padx=5, pady=5)
         self.view_dropdown.bind("<<ComboboxSelected>>", self.on_view_selected)
         
+        # Show all point clouds checkbox
+        self.show_all_clouds_var = tk.BooleanVar(value=self.show_all_point_clouds)
+        show_all_cb = ttk.Checkbutton(control_frame, text="Show All Views", 
+                                    variable=self.show_all_clouds_var, command=self.toggle_all_point_clouds)
+        show_all_cb.grid(row=1, column=0, columnspan=2, sticky=tk.W, padx=5, pady=5)
+        
+        # Debug mode checkbox
+        self.debug_mode_var = tk.BooleanVar(value=self.debug_mode)
+        debug_cb = ttk.Checkbutton(control_frame, text="Debug Mode", 
+                                 variable=self.debug_mode_var, command=self.toggle_debug_mode)
+        debug_cb.grid(row=2, column=0, columnspan=2, sticky=tk.W, padx=5, pady=5)
+        
         # Visualization options
         viz_frame = ttk.LabelFrame(right_panel, text="Visualization Options", padding="10")
         viz_frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
@@ -171,37 +213,45 @@ class RGBDPointCloudViewer:
         # Point size slider
         ttk.Label(viz_frame, text="Point Size:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
         self.point_size_var = tk.DoubleVar(value=self.point_size)
-        point_size_slider = ttk.Scale(viz_frame, from_=1.0, to=5.0, orient=tk.HORIZONTAL, 
-                                     variable=self.point_size_var, length=150)
+        point_size_slider = ttk.Scale(viz_frame, from_=1.0, to=10.0, orient=tk.HORIZONTAL, 
+                                    variable=self.point_size_var, length=150)
         point_size_slider.grid(row=0, column=1, sticky=tk.W, padx=5, pady=5)
         point_size_slider.bind("<ButtonRelease-1>", self.update_render_options)
+        
+        # Depth scale factor slider
+        ttk.Label(viz_frame, text="Depth Scale:").grid(row=1, column=0, sticky=tk.W, padx=5, pady=5)
+        self.depth_scale_var = tk.DoubleVar(value=self.depth_scale_factor)
+        depth_scale_slider = ttk.Scale(viz_frame, from_=0.001, to=0.1, orient=tk.HORIZONTAL, 
+                                     variable=self.depth_scale_var, length=150)
+        depth_scale_slider.grid(row=1, column=1, sticky=tk.W, padx=5, pady=5)
+        depth_scale_slider.bind("<ButtonRelease-1>", self.update_depth_scale)
         
         # Show coordinate frame
         self.coord_frame_var = tk.BooleanVar(value=self.show_coordinate_frame)
         coord_frame_cb = ttk.Checkbutton(viz_frame, text="Show Coordinate Frame", 
-                                       variable=self.coord_frame_var, command=self.toggle_coordinate_frame)
-        coord_frame_cb.grid(row=1, column=0, columnspan=2, sticky=tk.W, padx=5, pady=5)
+                                      variable=self.coord_frame_var, command=self.toggle_coordinate_frame)
+        coord_frame_cb.grid(row=2, column=0, columnspan=2, sticky=tk.W, padx=5, pady=5)
         
         # Show camera frustum
         self.camera_frustum_var = tk.BooleanVar(value=self.show_camera_frustum)
         camera_frustum_cb = ttk.Checkbutton(viz_frame, text="Show Camera Frustums", 
                                           variable=self.camera_frustum_var, command=self.toggle_camera_frustums)
-        camera_frustum_cb.grid(row=2, column=0, columnspan=2, sticky=tk.W, padx=5, pady=5)
+        camera_frustum_cb.grid(row=3, column=0, columnspan=2, sticky=tk.W, padx=5, pady=5)
         
         # Show normals
         self.normals_var = tk.BooleanVar(value=self.show_normals)
         normals_cb = ttk.Checkbutton(viz_frame, text="Show Normals", 
                                     variable=self.normals_var, command=self.toggle_normals)
-        normals_cb.grid(row=3, column=0, columnspan=2, sticky=tk.W, padx=5, pady=5)
+        normals_cb.grid(row=4, column=0, columnspan=2, sticky=tk.W, padx=5, pady=5)
         
         # Color mode
-        ttk.Label(viz_frame, text="Color Mode:").grid(row=4, column=0, sticky=tk.W, padx=5, pady=5)
+        ttk.Label(viz_frame, text="Color Mode:").grid(row=5, column=0, sticky=tk.W, padx=5, pady=5)
         
         color_modes = ["RGB", "Height", "Normal"]
         self.color_mode_var = tk.StringVar(value=self.color_mode)
         color_mode_dropdown = ttk.Combobox(viz_frame, textvariable=self.color_mode_var, 
                                          values=color_modes, width=10, state="readonly")
-        color_mode_dropdown.grid(row=4, column=1, sticky=tk.W, padx=5, pady=5)
+        color_mode_dropdown.grid(row=5, column=1, sticky=tk.W, padx=5, pady=5)
         color_mode_dropdown.bind("<<ComboboxSelected>>", self.update_color_mode)
         
         # Camera information frame
@@ -218,6 +268,11 @@ class RGBDPointCloudViewer:
         self.camera_res_label = ttk.Label(camera_info_frame, text="0 x 0")
         self.camera_res_label.grid(row=1, column=1, sticky=tk.W, padx=5, pady=2)
         
+        # Depth range
+        ttk.Label(camera_info_frame, text="Depth Range:").grid(row=2, column=0, sticky=tk.W, padx=5, pady=2)
+        self.depth_range_label = ttk.Label(camera_info_frame, text="0 - 0")
+        self.depth_range_label.grid(row=2, column=1, sticky=tk.W, padx=5, pady=2)
+        
         # Control buttons frame
         control_buttons_frame = ttk.Frame(right_panel, padding="10")
         control_buttons_frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
@@ -226,8 +281,12 @@ class RGBDPointCloudViewer:
         reset_view_btn = ttk.Button(control_buttons_frame, text="Reset View", command=self.reset_view)
         reset_view_btn.pack(side=tk.LEFT, padx=5, pady=5)
         
+        # Reload button
+        reload_btn = ttk.Button(control_buttons_frame, text="Reload", command=self.reload_current_view)
+        reload_btn.pack(side=tk.LEFT, padx=5, pady=5)
+        
         # Capture screenshot button
-        screenshot_btn = ttk.Button(control_buttons_frame, text="Take Screenshot", command=self.take_screenshot)
+        screenshot_btn = ttk.Button(control_buttons_frame, text="Screenshot", command=self.take_screenshot)
         screenshot_btn.pack(side=tk.LEFT, padx=5, pady=5)
         
         # Image preview frame
@@ -242,8 +301,18 @@ class RGBDPointCloudViewer:
         self.depth_label = ttk.Label(self.preview_frame)
         self.depth_label.pack(side=tk.TOP, padx=5, pady=5)
         
+        # Debug information frame - only visible in debug mode
+        self.debug_frame = ttk.LabelFrame(right_panel, text="Debug Information", padding="10")
+        if self.debug_mode:
+            self.debug_frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
+        
+        # Debug text box
+        self.debug_text = tk.Text(self.debug_frame, height=10, width=40, wrap=tk.WORD)
+        self.debug_text.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=5, pady=5)
+        self.debug_text.insert(tk.END, "Debug information will appear here...")
+        
         # Status bar
-        self.status_var = tk.StringVar(value="Ready")
+        self.status_var = tk.StringVar(value=self.status_message)
         status_bar = ttk.Label(self.root, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W)
         status_bar.pack(side=tk.BOTTOM, fill=tk.X)
         
@@ -267,14 +336,30 @@ class RGBDPointCloudViewer:
         render_option.light_on = True
         render_option.point_show_normal = self.show_normals
         
-        # Configure the camera view
+        # Add more lights to improve visibility
+        try:
+            # Set lighting to better show 3D structure
+            render_option.light_on = True
+            
+            # Add stronger ambient light
+            if hasattr(render_option, 'ambient_light'):
+                render_option.ambient_light = np.array([0.4, 0.4, 0.4])
+            
+            # Increase reflection parameters if available
+            if hasattr(render_option, 'shininess'):
+                render_option.shininess = 100.0
+        except Exception as e:
+            print(f"Warning: Could not set advanced lighting: {e}")
+        
+        # Configure the camera view for better initial visualization
         view_control = self.vis.get_view_control()
-        view_control.set_zoom(0.8)
+        view_control.set_zoom(0.5)  # Reduce zoom to see more of the point cloud
         
         # Add coordinate frame
-        self.coord_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.5)
+        self.coord_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=20.0)  # Make coordinate frame larger
         if self.show_coordinate_frame:
             self.vis.add_geometry(self.coord_frame)
+            self.visible_geometries.add(self.coord_frame)
         
         # Update visualization with initial view
         self.update_visualization()
@@ -303,31 +388,79 @@ class RGBDPointCloudViewer:
             img_path = os.path.join(base_dir, img_relative_path)
             depth_path = os.path.join(base_dir, depth_relative_path)
             
-            self.status_var.set(f"Loading image from: {img_path}")
-            print(f"Loading image from: {img_path}")
-            color_img = cv2.imread(img_path)
-            if color_img is None:
-                raise FileNotFoundError(f"Could not load image from {img_path}")
-            color_img = cv2.cvtColor(color_img, cv2.COLOR_BGR2RGB)
+            # Clear debug text if in debug mode
+            if self.debug_mode:
+                self.debug_text.delete(1.0, tk.END)
+                self.log_debug(f"Processing view {self.current_view_id}")
+                self.log_debug(f"Image path: {img_path}")
+                self.log_debug(f"Depth path: {depth_path}")
+                self.log_debug(f"Current depth scale factor: {self.depth_scale_factor}")
             
-            self.status_var.set(f"Loading depth from: {depth_path}")
-            print(f"Loading depth from: {depth_path}")
-            depth_img = np.load(depth_path)
-            
-            # Normalize depth for visualization
-            depth_min = view["depth_min"]
-            depth_max = view["depth_max"]
-            depth_scale = view["depth_scale"]
-            
-            # Get camera parameters
-            intrinsic = np.array(self.params["intrinsic_matrix"])
-            extrinsic = np.array(view["extrinsic_matrix"])
-            
-            # Create point cloud
-            self.status_var.set("Creating point cloud...")
-            pcd = create_point_cloud_from_rgbd(
-                color_img, depth_img, intrinsic, extrinsic, depth_scale, depth_min, depth_max
-            )
+            # Check if we already have this point cloud cached
+            if self.current_view_id in self.all_point_clouds and not self.show_all_point_clouds:
+                # Use cached point cloud
+                self.status_var.set(f"Using cached point cloud for View {self.current_view_id}")
+                pcd = self.all_point_clouds[self.current_view_id]
+            else:
+                # Load and process point cloud
+                self.status_var.set(f"Loading image from: {img_path}")
+                print(f"Loading image from: {img_path}")
+                color_img = cv2.imread(img_path)
+                if color_img is None:
+                    raise FileNotFoundError(f"Could not load image from {img_path}")
+                color_img = cv2.cvtColor(color_img, cv2.COLOR_BGR2RGB)
+                
+                self.status_var.set(f"Loading depth from: {depth_path}")
+                print(f"Loading depth from: {depth_path}")
+                depth_img = np.load(depth_path)
+                
+                # Normalize depth for visualization
+                depth_min = view["depth_min"]
+                depth_max = view["depth_max"]
+                depth_scale = view["depth_scale"]
+                
+                # Update depth range label
+                self.depth_range_label.config(text=f"{depth_min:.2f} - {depth_max:.2f}")
+                
+                if self.debug_mode:
+                    self.log_debug(f"Depth min: {depth_min}, max: {depth_max}, scale: {depth_scale}")
+                    self.log_debug(f"Depth img min: {np.min(depth_img)}, max: {np.max(depth_img)}")
+                
+                # Get camera parameters
+                intrinsic = np.array(self.params["intrinsic_matrix"])
+                extrinsic = np.array(view["extrinsic_matrix"])
+                
+                if self.debug_mode:
+                    self.log_debug(f"Intrinsic matrix: {intrinsic}")
+                    self.log_debug(f"Extrinsic matrix: {extrinsic}")
+                
+                # Create point cloud
+                self.status_var.set("Creating point cloud...")
+                
+                # Create point cloud with current settings
+                pcd = create_point_cloud_from_rgbd(
+                    color_img, depth_img, intrinsic, extrinsic, 
+                    depth_scale, depth_min, depth_max
+                )
+                
+                if self.debug_mode and pcd and len(pcd.points) > 0:
+                    # Get point cloud statistics
+                    points = np.asarray(pcd.points)
+                    self.log_debug(f"Point cloud points: {len(pcd.points)}")
+                    self.log_debug(f"Point cloud bounds X: {np.min(points[:, 0]):.2f} to {np.max(points[:, 0]):.2f}")
+                    self.log_debug(f"Point cloud bounds Y: {np.min(points[:, 1]):.2f} to {np.max(points[:, 1]):.2f}")
+                    self.log_debug(f"Point cloud bounds Z: {np.min(points[:, 2]):.2f} to {np.max(points[:, 2]):.2f}")
+                
+                # Cache the point cloud
+                self.all_point_clouds[self.current_view_id] = pcd
+                
+                # Update image previews
+                try:
+                    self.update_image_previews(color_img, depth_img, depth_min, depth_max)
+                except Exception as e:
+                    print(f"Warning: Could not update image previews: {e}")
+                    if self.debug_mode:
+                        self.log_debug(f"Error updating previews: {e}")
             
             # Apply color mode
             try:
@@ -337,11 +470,26 @@ class RGBDPointCloudViewer:
             
             # Update the visualization
             try:
-                if self.current_point_cloud is not None:
-                    self.vis.remove_geometry(self.current_point_cloud, reset_bounding_box=False)
+                # Remove all geometries except the coordinate frame
+                for geometry in list(self.visible_geometries):
+                    if geometry != self.coord_frame:
+                        self.vis.remove_geometry(geometry, reset_bounding_box=False)
+                self.visible_geometries = set()
+                if self.coord_frame and self.show_coordinate_frame:
+                    self.visible_geometries.add(self.coord_frame)
                 
-                self.current_point_cloud = pcd
-                self.vis.add_geometry(self.current_point_cloud, reset_bounding_box=False)
+                # Add current point cloud
+                if not self.show_all_point_clouds:
+                    self.vis.add_geometry(pcd, reset_bounding_box=False)
+                    self.visible_geometries.add(pcd)
+                    self.current_point_cloud = pcd
+                else:
+                    # Add all point clouds when in "show all" mode
+                    for view_id, point_cloud in self.all_point_clouds.items():
+                        self.vis.add_geometry(point_cloud, reset_bounding_box=False)
+                        self.visible_geometries.add(point_cloud)
+                    self.current_point_cloud = pcd
+                
             except Exception as e:
                 print(f"Warning: Error updating geometry: {e}")
                 self.status_var.set(f"Error: Could not update visualization - {str(e)}")
@@ -368,8 +516,8 @@ class RGBDPointCloudViewer:
             except Exception as e:
                 print(f"Warning: Could not update render options: {e}")
             
-            # Reset view if it's the first view
-            if self.current_view_id == 0:
+            # Reset view if it's the first view and not showing all
+            if self.current_view_id == 0 and not self.show_all_point_clouds:
                 try:
                     self.vis.reset_view_point(True)
                 except Exception as e:
@@ -381,13 +529,12 @@ class RGBDPointCloudViewer:
             except Exception as e:
                 print(f"Warning: Could not update renderer: {e}")
             
-            # Update image previews
-            try:
-                self.update_image_previews(color_img, depth_img, depth_min, depth_max)
-            except Exception as e:
-                print(f"Warning: Could not update image previews: {e}")
-            
-            self.status_var.set(f"Showing View {self.current_view_id} | {len(np.asarray(pcd.points))} points")
+            num_points = len(np.asarray(pcd.points)) if pcd else 0
+            if self.show_all_point_clouds:
+                total_points = sum([len(np.asarray(pc.points)) for pc in self.all_point_clouds.values()])
+                self.status_var.set(f"Showing All Views | Total points: {total_points}")
+            else:
+                self.status_var.set(f"Showing View {self.current_view_id} | {num_points} points")
         except Exception as e:
             print(f"Error in update_visualization: {e}")
             self.status_var.set(f"Error: {str(e)}")
@@ -427,12 +574,17 @@ class RGBDPointCloudViewer:
     def toggle_coordinate_frame(self):
         """Toggle the coordinate frame visibility"""
         self.show_coordinate_frame = self.coord_frame_var.get()
+        
         if self.show_coordinate_frame:
             # Add coordinate frame if not already added
-            self.vis.add_geometry(self.coord_frame, reset_bounding_box=False)
+            if self.coord_frame not in self.visible_geometries:
+                self.vis.add_geometry(self.coord_frame, reset_bounding_box=False)
+                self.visible_geometries.add(self.coord_frame)
         else:
             # Remove coordinate frame if it exists
-            self.vis.remove_geometry(self.coord_frame, reset_bounding_box=False)
+            if self.coord_frame in self.visible_geometries:
+                self.vis.remove_geometry(self.coord_frame, reset_bounding_box=False)
+                self.visible_geometries.remove(self.coord_frame)
         
         render_option = self.vis.get_render_option()
         render_option.show_coordinate_frame = self.show_coordinate_frame
@@ -445,7 +597,9 @@ class RGBDPointCloudViewer:
         
         # Remove existing frustums
         for frustum in self.camera_frustums:
-            self.vis.remove_geometry(frustum, reset_bounding_box=False)
+            if frustum in self.visible_geometries:
+                self.vis.remove_geometry(frustum, reset_bounding_box=False)
+                self.visible_geometries.remove(frustum)
         
         self.camera_frustums = []
         
@@ -459,7 +613,9 @@ class RGBDPointCloudViewer:
         """Update camera frustums visualization"""
         # Remove existing frustums
         for frustum in self.camera_frustums:
-            self.vis.remove_geometry(frustum, reset_bounding_box=False)
+            if frustum in self.visible_geometries:
+                self.vis.remove_geometry(frustum, reset_bounding_box=False)
+                self.visible_geometries.remove(frustum)
         
         self.camera_frustums = []
         
@@ -477,14 +633,15 @@ class RGBDPointCloudViewer:
             # Create a simple frustum visualization
             frustum = o3d.geometry.LineSet()
             
-            # Define frustum corners in camera space
+            # Define frustum corners in camera space - make larger for better visibility
+            scale = 30.0  # Scale up the frustum size significantly
             frustum_points = np.array([
                 [0, 0, 0],  # Camera center
                 # Near plane corners
-                [-0.5, -0.3, 1],
-                [0.5, -0.3, 1],
-                [0.5, 0.3, 1],
-                [-0.5, 0.3, 1]
+                [-0.5 * scale, -0.3 * scale, 1.0 * scale],
+                [0.5 * scale, -0.3 * scale, 1.0 * scale],
+                [0.5 * scale, 0.3 * scale, 1.0 * scale],
+                [-0.5 * scale, 0.3 * scale, 1.0 * scale]
             ])
             
             # Define lines
@@ -513,6 +670,7 @@ class RGBDPointCloudViewer:
             # Add to the list and visualizer
             self.camera_frustums.append(frustum)
             self.vis.add_geometry(frustum, reset_bounding_box=False)
+            self.visible_geometries.add(frustum)
     
     def toggle_normals(self):
         """Toggle normal vector visualization"""
@@ -596,6 +754,67 @@ class RGBDPointCloudViewer:
         # Capture image
         self.vis.capture_screen_image(screenshot_path, True)
         self.status_var.set(f"Screenshot saved to {screenshot_path}")
+    
+    def toggle_all_point_clouds(self):
+        """Toggle showing all point clouds simultaneously"""
+        self.show_all_point_clouds = self.show_all_clouds_var.get()
+        self.update_visualization()
+    
+    def update_depth_scale(self, event=None):
+        """Update depth scale factor and regenerate point clouds"""
+        # Get the new depth scale factor
+        new_scale = self.depth_scale_var.get()
+        if new_scale != self.depth_scale_factor:
+            self.depth_scale_factor = new_scale
+            self.status_var.set(f"Updating depth scale to {self.depth_scale_factor:.2f}...")
+            
+            # Clear cached point clouds to force regeneration
+            # First, remove them from the visualization
+            try:
+                for point_cloud in self.all_point_clouds.values():
+                    if point_cloud in self.visible_geometries:
+                        self.vis.remove_geometry(point_cloud, reset_bounding_box=False)
+                        self.visible_geometries.remove(point_cloud)
+            except Exception as e:
+                print(f"Warning: Error removing point clouds: {e}")
+            
+            # Clear the cache
+            self.all_point_clouds = {}
+            
+            # Update the visualization
+            self.update_visualization()
+    
+    def toggle_debug_mode(self):
+        """Toggle debug mode on/off"""
+        self.debug_mode = self.debug_mode_var.get()
+        
+        # Show or hide the debug frame
+        if self.debug_mode:
+            self.debug_frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5, after=self.preview_frame)
+        else:
+            self.debug_frame.pack_forget()
+    
+    def log_debug(self, message):
+        """Log a debug message to the debug text box"""
+        if self.debug_mode:
+            self.debug_text.insert(tk.END, f"{message}\n")
+            self.debug_text.see(tk.END)  # Scroll to the bottom
+    
+    def reload_current_view(self):
+        """Reload the current view by clearing the cache and updating"""
+        if self.current_view_id in self.all_point_clouds:
+            # Remove the current point cloud from visualization
+            current_pcd = self.all_point_clouds[self.current_view_id]
+            if current_pcd in self.visible_geometries:
+                self.vis.remove_geometry(current_pcd, reset_bounding_box=False)
+                self.visible_geometries.remove(current_pcd)
+            
+            # Remove from cache
+            del self.all_point_clouds[self.current_view_id]
+        
+        # Update visualization
+        self.status_var.set(f"Reloading View {self.current_view_id}...")
+        self.update_visualization()
     
     def run(self):
         """Run the viewer application"""
