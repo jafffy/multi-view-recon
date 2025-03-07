@@ -3,3 +3,7 @@ numpy>=1.20.0
 opencv-python>=4.5.0
 tqdm>=4.62.0 
 matplotlib>=3.4.0
+# COLMAP should be installed separately following instructions at https://colmap.github.io/install.html
+# For Windows, download from https://github.com/colmap/colmap/releases
+# For Linux: sudo apt-get install colmap
+# For macOS: brew install colmap

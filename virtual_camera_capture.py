@@ -12,7 +12,7 @@ import time
 from point_cloud_utils import PointCloudProcessor
 
 class VirtualCameraCapture:
-    def __init__(self, ply_path, output_dir=None, resolution=(1280, 720)):
+    def __init__(self, ply_path, output_dir=None, resolution=(1280, 720), capture_depth=True):
         """
         Initialize the virtual camera capture system
         
@@ -20,9 +20,11 @@ class VirtualCameraCapture:
             ply_path (str): Path to the input PLY file
             output_dir (str, optional): Output directory for rendered images
             resolution (tuple): Image resolution as (width, height)
+            capture_depth (bool): Whether to capture depth images
         """
         self.resolution = resolution
         self.ply_path = ply_path  # Store the PLY file path
+        self.capture_depth = capture_depth
         
         # Set output directory
         if output_dir is None:
@@ -33,6 +35,11 @@ class VirtualCameraCapture:
         os.makedirs(output_dir, exist_ok=True)
         os.makedirs(os.path.join(output_dir, "images"), exist_ok=True)
         self.images_dir = os.path.join(output_dir, "images")  # Store the images directory path
+        
+        # Create a directory for depth images
+        if self.capture_depth:
+            os.makedirs(os.path.join(output_dir, "depth"), exist_ok=True)
+            self.depth_dir = os.path.join(output_dir, "depth")  # Store the depth images directory path
         
         # Cache directory for normals
         self.cache_dir = os.path.join(output_dir, "cache")
@@ -164,35 +171,92 @@ class VirtualCameraCapture:
         
         # Render and capture the image
         img = None
+        depth = None
         for _ in range(3):  # Try a few times to ensure proper rendering
             vis.poll_events()
             vis.update_renderer()
             image = vis.capture_screen_float_buffer(do_render=True)
-            if image is not None:
-                img = (np.asarray(image) * 255).astype(np.uint8)
-                img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-                break
+            
+            if self.capture_depth:
+                depth_image = vis.capture_depth_float_buffer(do_render=True)
+                if image is not None and depth_image is not None:
+                    img = (np.asarray(image) * 255).astype(np.uint8)
+                    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+                    depth = np.asarray(depth_image)
+                    break
+            else:
+                if image is not None:
+                    img = (np.asarray(image) * 255).astype(np.uint8)
+                    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+                    break
+                    
             time.sleep(0.1)
         
         if img is None:
             print(f"Warning: Failed to capture image for view {view_id}")
             vis.destroy_window()
             return False
+            
+        if self.capture_depth and depth is None:
+            print(f"Warning: Failed to capture depth for view {view_id}")
+            vis.destroy_window()
+            return False
         
-        # Save the image
+        # Save the RGB image
         image_path = os.path.join(self.images_dir, f"view_{view_id:03d}.jpg")
         cv2.imwrite(image_path, img)
         
-        # Get the actual camera parameters
-        params = view_control.convert_to_pinhole_camera_parameters()
-        
-        # Store frame data
-        self.captured_frames.append({
+        # Prepare frame data with camera extrinsics and position
+        frame_data = {
             'view_id': view_id,
             'image_path': image_path,
-            'extrinsic_matrix': params.extrinsic.tolist(),
+            'extrinsic_matrix': view_control.convert_to_pinhole_camera_parameters().extrinsic.tolist(),
             'camera_position': eye_pos.tolist()
-        })
+        }
+        
+        # Process depth data if needed
+        if self.capture_depth:
+            # Normalize depth for visualization
+            depth_vis = np.zeros_like(depth)
+            depth_mask = depth > 0
+            if np.any(depth_mask):
+                valid_depth = depth[depth_mask]
+                depth_min = np.min(valid_depth)
+                depth_max = np.max(valid_depth)
+                depth_scale = depth_max - depth_min  # Calculate depth scale
+                depth_vis[depth_mask] = (depth[depth_mask] - depth_min) / (depth_scale if depth_scale != 0 else 1)
+                depth_vis = (depth_vis * 255).astype(np.uint8)
+                
+                # Print depth scale information
+                print(f"Depth information for view {view_id}:")
+                print(f"  - Minimum depth: {depth_min:.4f}")
+                print(f"  - Maximum depth: {depth_max:.4f}")
+                print(f"  - Depth scale: {depth_scale:.4f}")
+            else:
+                depth_min = depth_max = depth_scale = 0
+                print(f"No valid depth points for view {view_id}")
+            
+            # Save raw depth data
+            depth_path = os.path.join(self.depth_dir, f"depth_{view_id:03d}.npy")
+            np.save(depth_path, depth)
+            
+            # Save depth visualization for inspection
+            depth_vis_path = os.path.join(self.depth_dir, f"depth_{view_id:03d}.png")
+            cv2.imwrite(depth_vis_path, depth_vis)
+            
+            # Add depth related info to frame data
+            frame_data['depth_path'] = depth_path
+            frame_data['depth_vis_path'] = depth_vis_path
+            frame_data['depth_min'] = float(depth_min)
+            frame_data['depth_max'] = float(depth_max)
+            frame_data['depth_scale'] = float(depth_scale)
+            
+            print(f"Saved view {view_id}: {image_path} and depth: {depth_path}")
+        else:
+            print(f"Saved view {view_id}: {image_path}")
+        
+        # Store frame data
+        self.captured_frames.append(frame_data)
         
         # Clean up
         vis.destroy_window()
@@ -203,12 +267,16 @@ class VirtualCameraCapture:
             print(f"Warning: View {view_id} may be empty or not showing the point cloud")
             return False
             
-        print(f"Saved view {view_id}: {image_path}")
         return True
     
     def capture_multiview(self, num_views=20):
         """
-        Capture multiple views of the point cloud from different viewpoints
+        Capture multiple views of the point cloud from different viewpoints.
+        This captures both RGB images and depth maps (unless capture_depth=False).
+        
+        The RGB images are saved as JPEG files in the 'images' directory.
+        The depth maps are saved as NumPy (.npy) files in the 'depth' directory.
+        A visualization of the depth maps is also saved as PNG files.
         
         Args:
             num_views (int): Number of views to capture
@@ -242,7 +310,11 @@ class VirtualCameraCapture:
     
     def save_camera_parameters(self):
         """
-        Save camera parameters to JSON file
+        Save camera parameters to JSON file.
+        
+        This includes intrinsic and extrinsic camera parameters,
+        paths to RGB images and depth maps (if captured),
+        and information about the point cloud.
         """
         params = {
             'intrinsic_matrix': self.intrinsic_matrix.tolist(),
@@ -262,7 +334,7 @@ class VirtualCameraCapture:
         print(f"Camera parameters saved to: {params_path}")
 
 def main():
-    parser = argparse.ArgumentParser(description='Virtual camera multi-view capture tool')
+    parser = argparse.ArgumentParser(description='Virtual camera multi-view capture tool for RGB and depth images')
     parser.add_argument('ply_file', type=str,
                         help='Path to the PLY file to capture')
     parser.add_argument('--output', '-o', type=str, default=None,
@@ -273,6 +345,8 @@ def main():
                         help='Number of views to capture (default: 20)')
     parser.add_argument('--no-preview', action='store_true',
                         help='Skip the point cloud preview')
+    parser.add_argument('--no-depth', action='store_true',
+                        help='Skip capturing depth images (RGB images only)')
     
     args = parser.parse_args()
     
@@ -285,7 +359,8 @@ def main():
         vcc = VirtualCameraCapture(
             ply_path=args.ply_file,
             output_dir=args.output,
-            resolution=resolution
+            resolution=resolution,
+            capture_depth=not args.no_depth
         )
         
         # Capture multiple views
