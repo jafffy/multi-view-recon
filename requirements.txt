@@ -8,3 +8,5 @@ pillow>=10.0.0
 # For Windows, download from https://github.com/colmap/colmap/releases
 # For Linux: sudo apt-get install colmap
 # For macOS: brew install colmap
+lpips>=0.1.4
+PyQt5>=5.15.0
